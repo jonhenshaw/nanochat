@@ -23,7 +23,7 @@ from nanochat.gpt import GPT, GPTConfig
 from nanochat.dataloader import tokenizing_distributed_data_loader
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
-from nanochat.checkpoint_manager import save_checkpoint
+from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint, find_last_step
 from nanochat.loss_eval import evaluate_bpb
 from nanochat.engine import Engine
 from scripts.base_eval import evaluate_model
@@ -60,6 +60,10 @@ core_metric_max_per_task = 500 # examples per task in estimating the core metric
 sample_every = 2000 # every how many steps to sample from the model
 # Output
 model_tag = "" # optionally override the model tag for the output checkpoint directory name
+# Checkpointing / resume
+ckpt_every = 500    # save every N steps; set -1 to disable
+resume_tag = ""     # e.g. "d20"; empty => no resume
+resume_step = -1    # -1 => auto-detect last step in tag
 # now allow CLI to override the settings via the configurator lol
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open(os.path.join('nanochat', 'configurator.py')).read()) # overrides from command line or config file
@@ -143,6 +147,29 @@ print0(f"Total training FLOPs estimate: {num_flops_per_token * total_tokens:e}")
 optimizers = model.setup_optimizers(unembedding_lr=unembedding_lr, embedding_lr=embedding_lr, matrix_lr=matrix_lr, weight_decay=weight_decay)
 adamw_optimizer, muon_optimizer = optimizers
 
+# Optional resume from checkpoint
+if resume_tag:
+    base_dir = get_base_dir()
+    ckpt_dir = os.path.join(base_dir, "base_checkpoints", resume_tag)
+    if resume_step < 0:
+        resume_step = find_last_step(ckpt_dir)
+    model_state, optimizer_states, meta = load_checkpoint(ckpt_dir, resume_step, device, load_optimizer=True)
+    orig_model.load_state_dict(model_state, strict=True, assign=True)
+    if optimizer_states is not None:
+        for opt, st in zip(optimizers, optimizer_states):
+            opt.load_state_dict(st)
+    # best-so-far val bpb if available
+    min_val_bpb = meta.get("val_bpb", float("inf"))
+    print0(f"Resuming from tag {resume_tag} at step {resume_step}")
+else:
+    # initialize best-so-far metric on fresh runs
+    min_val_bpb = float("inf")
+
+# If resuming, reduce remaining iterations accordingly
+if resume_tag and resume_step > 0:
+    num_iterations = max(0, num_iterations - resume_step)
+    print0(f"Adjusted num_iterations to {num_iterations:,} after resume")
+
 # Initialize the DataLoaders for train/val
 base_dir = get_base_dir()
 tokens_dir = os.path.join(base_dir, "tokenized_data")
@@ -173,7 +200,6 @@ def get_muon_momentum(it):
 
 # -----------------------------------------------------------------------------
 # Training loop
-min_val_bpb = float("inf")
 smooth_train_loss = 0 # EMA of training loss
 ema_beta = 0.9 # EMA decay factor
 total_training_time = 0 # total wall-clock time of training
@@ -318,6 +344,25 @@ for step in range(num_iterations + 1):
         if grad_clip_enabled:
             log_data["train/grad_norm"] = grad_norm
         wandb_run.log(log_data)
+
+    # periodic checkpointing
+    if master_process and ckpt_every > 0 and (step > 0 and (step % ckpt_every == 0 or last_step)):
+        output_dirname = model_tag if model_tag else f"d{depth}"
+        checkpoint_dir = os.path.join(base_dir, "base_checkpoints", output_dirname)
+        save_checkpoint(
+            checkpoint_dir,
+            step,
+            orig_model.state_dict(),
+            [opt.state_dict() for opt in optimizers],
+            {
+                "step": step,
+                "val_bpb": min_val_bpb,
+                "model_config": model_config_kwargs,
+                "user_config": user_config,
+                "device_batch_size": device_batch_size,
+                "max_seq_len": max_seq_len,
+            }
+        )
 
 # print a few more stats
 print0(f"Peak memory usage: {get_max_memory() / 1024 / 1024:.2f}MiB")
