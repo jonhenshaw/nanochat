@@ -72,7 +72,9 @@ class Muon(torch.optim.Optimizer):
             params: list[Tensor] = group["params"]
             for p in params:
                 g = p.grad
-                assert g is not None
+                # Treat missing gradients as zeros to allow robust training/resume
+                if g is None:
+                    g = torch.zeros_like(p)
                 state = self.state[p]
                 if "momentum_buffer" not in state:
                     state["momentum_buffer"] = torch.zeros_like(g)
@@ -128,8 +130,11 @@ class DistMuon(torch.optim.Optimizer):
         rank = dist.get_rank()
         world_size = dist.get_world_size()
 
-        # Ensure all grads exist
-        assert all(p.grad is not None for group in self.param_groups for p in group["params"]), "All params must have grads"
+        # Ensure all grads exist; initialize missing grads to zeros
+        for group in self.param_groups:
+            for p in group["params"]:
+                if p.grad is None:
+                    p.grad = torch.zeros_like(p)
 
         # Kick off all the reduce scatter operations to average up the gradients across all ranks
         all_reduce_futures = []

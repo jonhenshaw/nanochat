@@ -64,6 +64,8 @@ model_tag = "" # optionally override the model tag for the output checkpoint dir
 ckpt_every = 500    # save every N steps; set -1 to disable
 resume_tag = ""     # e.g. "d20"; empty => no resume
 resume_step = -1    # -1 => auto-detect last step in tag
+# Whether to load optimizer state when resuming (1=yes, 0=no). Disabling avoids mismatches.
+resume_load_optimizer = 1
 # now allow CLI to override the settings via the configurator lol
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open(os.path.join('nanochat', 'configurator.py')).read()) # overrides from command line or config file
@@ -153,11 +155,14 @@ if resume_tag:
     ckpt_dir = os.path.join(base_dir, "base_checkpoints", resume_tag)
     if resume_step < 0:
         resume_step = find_last_step(ckpt_dir)
-    model_state, optimizer_states, meta = load_checkpoint(ckpt_dir, resume_step, device, load_optimizer=True)
+    model_state, optimizer_states, meta = load_checkpoint(ckpt_dir, resume_step, device, load_optimizer=bool(resume_load_optimizer))
     orig_model.load_state_dict(model_state, strict=True, assign=True)
-    if optimizer_states is not None:
-        for opt, st in zip(optimizers, optimizer_states):
-            opt.load_state_dict(st)
+    if optimizer_states is not None and bool(resume_load_optimizer):
+        try:
+            for opt, st in zip(optimizers, optimizer_states):
+                opt.load_state_dict(st)
+        except (ValueError, RuntimeError) as e:
+            print0(f"Warning: Failed to load optimizer state, continuing without it: {e}")
     # best-so-far val bpb if available
     min_val_bpb = meta.get("val_bpb", float("inf"))
     print0(f"Resuming from tag {resume_tag} at step {resume_step}")

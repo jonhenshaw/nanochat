@@ -27,7 +27,12 @@ class DistAdamW(torch.optim.Optimizer):
         for group in self.param_groups:
             params: list[Tensor] = group["params"]
             for base_i in range(len(params)):
-                grad = params[base_i].grad
+                p = params[base_i]
+                grad = p.grad
+                # Guard against None grads by treating them as zeros (common when a param
+                # receives no gradient in a particular step or after set_to_none=True).
+                if grad is None:
+                    grad = torch.zeros_like(p)
                 rank_size = grad.shape[0] // world_size
                 grad_slice = torch.empty_like(grad[:rank_size])
                 reduce_scatter_futures.append(dist.reduce_scatter_tensor(grad_slice, grad, op=dist.ReduceOp.AVG, async_op=True).get_future())
