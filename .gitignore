@@ -1,7 +1,25 @@
 .venv/
+venv/
+env/
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+.Python
 rustbpe/target/
+*.so
+*.d
+*.whl
 dev-ignore/
 report.md
 eval_bundle/
+
+# Log files (except main speedrun.log)
+*.log
+!speedrun.log
+wandb/**/*.log
+wandb/debug*.log
+torchrun-logs/
+
+# WandB run artifacts
+wandb/run-*/

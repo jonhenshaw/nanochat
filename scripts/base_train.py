@@ -143,6 +143,7 @@ total_tokens = total_batch_size * num_iterations
 print0(f"Total number of training tokens: {total_tokens:,}")
 print0(f"Tokens : Params ratio: {total_batch_size * num_iterations / num_params:.2f}") # Chinchilla is ~20
 print0(f"Total training FLOPs estimate: {num_flops_per_token * total_tokens:e}")
+total_iterations = num_iterations
 
 # -----------------------------------------------------------------------------
 # Initialize the Optimizer (Muon for Linear layers, AdamW for embedding and lm_head)
@@ -163,12 +164,18 @@ if resume_tag:
                 opt.load_state_dict(st)
         except (ValueError, RuntimeError) as e:
             print0(f"Warning: Failed to load optimizer state, continuing without it: {e}")
+    for opt in optimizers:
+        for group in opt.param_groups:
+            if "initial_lr" not in group:
+                group["initial_lr"] = group["lr"]
     # best-so-far val bpb if available
     min_val_bpb = meta.get("val_bpb", float("inf"))
     print0(f"Resuming from tag {resume_tag} at step {resume_step}")
 else:
     # initialize best-so-far metric on fresh runs
     min_val_bpb = float("inf")
+
+step_offset = resume_step if resume_tag else 0
 
 # If resuming, reduce remaining iterations accordingly
 if resume_tag and resume_step > 0:
@@ -211,7 +218,8 @@ total_training_time = 0 # total wall-clock time of training
 # note that we run +1 steps only so that we can eval and save at the end
 for step in range(num_iterations + 1):
     last_step = step == num_iterations
-    flops_so_far = num_flops_per_token * total_batch_size * step
+    global_step = step + step_offset
+    flops_so_far = num_flops_per_token * total_batch_size * global_step
 
     # once in a while: evaluate the val bpb (all ranks participate)
     if last_step or step % eval_every == 0:
@@ -220,11 +228,11 @@ for step in range(num_iterations + 1):
         eval_steps = eval_tokens // (device_batch_size * max_seq_len * ddp_world_size)
         with autocast_ctx:
             val_bpb = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
-        print0(f"Step {step:05d} | Validation bpb: {val_bpb:.4f}")
+        print0(f"Step {global_step:05d} | Validation bpb: {val_bpb:.4f}")
         if val_bpb < min_val_bpb:
             min_val_bpb = val_bpb
         wandb_run.log({
-            "step": step,
+            "step": global_step,
             "total_training_flops": flops_so_far,
             "total_training_time": total_training_time,
             "val/bpb": val_bpb,
@@ -238,9 +246,9 @@ for step in range(num_iterations + 1):
         model.eval()
         with autocast_ctx:
             results = evaluate_model(orig_model, tokenizer, device, max_per_task=core_metric_max_per_task)
-        print0(f"Step {step:05d} | CORE metric: {results['core_metric']:.4f}")
+        print0(f"Step {global_step:05d} | CORE metric: {results['core_metric']:.4f}")
         wandb_run.log({
-            "step": step,
+            "step": global_step,
             "total_training_flops": flops_so_far,
             "core_metric": results["core_metric"],
             "centered_results": results["centered_results"],
@@ -274,11 +282,11 @@ for step in range(num_iterations + 1):
         checkpoint_dir = os.path.join(base_dir, "base_checkpoints", output_dirname)
         save_checkpoint(
             checkpoint_dir,
-            step,
+            global_step,
             orig_model.state_dict(),
             [opt.state_dict() for opt in optimizers], # TODO: make sure saving across ranks is done correctly
             {
-                "step": step,
+                "step": global_step,
                 "val_bpb": val_bpb, # loss at last step
                 "model_config": model_config_kwargs,
                 "user_config": user_config, # inputs to the training script
@@ -326,7 +334,6 @@ for step in range(num_iterations + 1):
     # logging
     smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss.item() # EMA the training loss
     debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**(step + 1)) # debias the EMA
-    pct_done = 100 * step / num_iterations
     tok_per_sec = int(total_batch_size / dt)
     flops_per_sec = num_flops_per_token * total_batch_size / dt
     promised_flops_per_sec_h100 = 989e12 * ddp_world_size # bfloat16 H100 SXM and without 2:4 sparsity
@@ -334,10 +341,11 @@ for step in range(num_iterations + 1):
     if step > 10:
         total_training_time += dt # only count the time after the first 10 steps
     print_grad_norm = f" grad norm: {grad_norm:.4f} |" if grad_clip_enabled else ""
-    print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} |{print_grad_norm} lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.2f} | total time: {total_training_time/60:.2f}m")
+    pct_done = 100 * global_step / total_iterations if total_iterations > 0 else 0.0
+    print0(f"step {global_step:05d}/{total_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} |{print_grad_norm} lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.2f} | total time: {total_training_time/60:.2f}m")
     if step % 100 == 0:
         log_data = {
-            "step": step,
+            "step": global_step,
             "total_training_flops": flops_so_far,
             "total_training_time": total_training_time,
             "train/loss": debiased_smooth_loss,
@@ -351,16 +359,16 @@ for step in range(num_iterations + 1):
         wandb_run.log(log_data)
 
     # periodic checkpointing
-    if master_process and ckpt_every > 0 and (step > 0 and (step % ckpt_every == 0 or last_step)):
+    if master_process and ckpt_every > 0 and global_step > 0 and (global_step % ckpt_every == 0):
         output_dirname = model_tag if model_tag else f"d{depth}"
         checkpoint_dir = os.path.join(base_dir, "base_checkpoints", output_dirname)
         save_checkpoint(
             checkpoint_dir,
-            step,
+            global_step,
             orig_model.state_dict(),
             [opt.state_dict() for opt in optimizers],
             {
-                "step": step,
+                "step": global_step,
                 "val_bpb": min_val_bpb,
                 "model_config": model_config_kwargs,
                 "user_config": user_config,
